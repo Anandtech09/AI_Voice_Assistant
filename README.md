@@ -36,6 +36,7 @@ Pipecat is the preferred framework because:
 - Flexible `FastAPIWebsocketTransport` to integrate voice pipelines directly inside FastAPI routers.
 - Pipeline-based architecture that makes it simple to integrate VAD (Voice Activity Detection), LLMs, and custom context aggregators.
 - Production-grade framework aligned with modern conversational AI designs.
+- Connecting Twilio directly to Gemini's Multimodal Live API over raw WebSockets requires managing audio encoding mismatches, interruption pipelines, and frame buffering yourself.
 
 ## 📋 Prerequisites
 
@@ -237,15 +238,3 @@ AI_Voice_Assistant/
 - [Twilio Voice](https://www.twilio.com/docs/voice)
 - [FastAPI](https://fastapi.tiangolo.com/)
 - [ngrok](https://ngrok.com/docs)
-│  Phone User  │◄──────►│  Twilio Voice    │◄─────►│  FastAPI Server │
-│              │       │  (Media Streams)  │       │  (Pipecat)      │
-└──────────────┘       └──────────────────┘       └────────┬────────┘
-                                                           │
-                                                           │ WebSocket
-                                                           ▼
-                                                  ┌─────────────────┐
-                                                  │  Gemini Live    │
-                                                  │  API            │
-                                                  │  (Speech-to-    │
-                                                  │   Speech)       │
-                                                  └─────────────────┘
