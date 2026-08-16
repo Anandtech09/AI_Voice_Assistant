@@ -19,3 +19,8 @@ python-multipart
 
 # Async support
 aiohttp
+
+# Testing (install with: pip install -r requirements.txt)
+pytest
+pytest-asyncio
+httpx
