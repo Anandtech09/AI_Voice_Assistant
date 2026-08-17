@@ -53,3 +53,6 @@ ngrok.exe
 extract_docx.ps1
 ai_call_text.txt
 understanding.md
+
+# Agent Context
+.agents/

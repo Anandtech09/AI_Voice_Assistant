@@ -4,6 +4,7 @@ Call summary writer for Stelar Interior AI Voice Agent.
 After each call, writes a structured .txt file with all collected
 client details, conversation transcript, and key highlights for the team.
 Uses Gemini LLM to intelligently extract client details from transcripts (English, Malayalam, etc.).
+Deduplicates file creation so exactly ONE .txt summary file is created per call.
 """
 
 import os
@@ -16,6 +17,9 @@ from app.utils.logger import logger
 
 # Directory where call summaries are stored
 CALL_LOGS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "call_logs")
+
+# Map call_sid -> filename to ensure exactly ONE file per call
+_call_file_map: Dict[str, str] = {}
 
 
 def ensure_log_directory():
@@ -151,14 +155,23 @@ def save_summary(
     requirements: str = "",
     conversation_summary: str = "",
     transcript: str = "",
+    call_sid: str = "",
 ) -> str:
     """
-    Write a call summary .txt file for the team.
+    Write or update a single call summary .txt file per call_sid.
     """
     ensure_log_directory()
 
     timestamp = datetime.now()
-    filename = f"call_{timestamp.strftime('%Y-%m-%d_%H-%M-%S')}.txt"
+
+    # Deduplicate file per call_sid
+    if call_sid and call_sid in _call_file_map:
+        filename = _call_file_map[call_sid]
+    else:
+        filename = f"call_{timestamp.strftime('%Y-%m-%d_%H-%M-%S')}.txt"
+        if call_sid:
+            _call_file_map[call_sid] = filename
+
     filepath = os.path.join(CALL_LOGS_DIR, filename)
 
     existing_details = {
@@ -230,7 +243,7 @@ def save_summary(
     try:
         with open(filepath, "w", encoding="utf-8") as f:
             f.write(content)
-        logger.info(f"📝 Call summary saved: {filename}")
+        logger.info(f"📝 Call summary saved ({filename})")
     except Exception as e:
         logger.error(f"❌ Failed to save call summary: {e}")
         return ""

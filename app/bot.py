@@ -3,10 +3,10 @@ Pipecat pipeline setup for the Stelar Interior AI Voice Agent.
 
 Configures the voice agent pipeline with:
 - Twilio WebSocket transport (audio I/O)
-- Gemini Live LLM service (speech-to-speech AI)
+- Gemini Live LLM service (speech-to-speech AI with echo proofing)
 - Tool/function registration (datetime, weather, KB, call summary)
 - Automatic call summary on disconnect
-- Barge-in support
+- Real user barge-in support without echo cut-offs
 """
 
 from google.genai.types import ThinkingConfig
@@ -46,6 +46,27 @@ from app.utils.logger import (
     log_tool_invoked,
     log_tool_result,
 )
+from app.processors.audio_gate import AudioGateProcessor
+from app.processors.idle_monitor import IdleMonitorProcessor
+
+
+class EchoProofGeminiLLMService(GeminiLiveLLMService):
+    """
+    Subclass of GeminiLiveLLMService that suppresses server-side VAD echo interruptions
+    unless local Silero VAD confirms that the user is actively speaking.
+    Prevents false voice breaks, sentence cut-offs, and delayed response bugs.
+    """
+    def __init__(self, *args, user_aggregator=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._user_aggregator = user_aggregator
+
+    async def broadcast_interruption(self):
+        if self._user_aggregator:
+            is_user_speaking = getattr(self._user_aggregator, "_user_speaking", False)
+            if not is_user_speaking:
+                logger.debug("🛡️ Suppressed false Gemini server VAD echo interruption (user is not speaking)")
+                return
+        await super().broadcast_interruption()
 
 
 # Track whether summary was saved during the call (via Gemini tool call)
@@ -56,7 +77,7 @@ async def run_bot(websocket, stream_sid: str = None, call_sid: str = None):
     """
     Set up and run the Pipecat voice agent pipeline.
 
-    Pipeline: Twilio Audio In → VAD → Gemini Live → Twilio Audio Out
+    Pipeline: Twilio Audio In → VAD → EchoProof Gemini Live → Twilio Audio Out
     """
 
     log_pipeline_event("INITIALIZING", f"Stream SID: {stream_sid}")
@@ -93,25 +114,49 @@ async def run_bot(websocket, stream_sid: str = None, call_sid: str = None):
         ),
     )
 
-    # 2. Configure Gemini Live LLM Service
-    # Use proper ThinkingConfig type to avoid Pydantic serialization warnings
-    # and ensure thinking_budget=0 is actually applied (reduces latency).
-    # Disable server-side VAD (vad=GeminiVADParams(disabled=True)) so that local Silero VAD
-    # controls turn boundaries and sends explicit ActivityStart/ActivityEnd signals.
-    # This prevents the LLM from responding to old/interrupted questions on new turns.
-    llm = GeminiLiveLLMService(
+    # 2. Setup Conversation Context & VAD
+    messages = [
+        {
+            "role": "user",
+            "content": "Welcome the caller to Stelar Interior. Tell them we offer a free site visit, and ask how you can help with their interior design today.",
+        }
+    ]
+
+    context = LLMContext(messages)
+    user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
+        context,
+        user_params=LLMUserAggregatorParams(
+            vad_analyzer=SileroVADAnalyzer(
+                params=VADParams(
+                    start_secs=0.2,
+                    stop_secs=0.2,
+                    confidence=0.5,
+                    min_volume=0.1,
+                )
+            ),
+            user_turn_strategies=UserTurnStrategies(
+                start=[VADUserTurnStartStrategy()],
+                stop=[SpeechTimeoutUserTurnStopStrategy(user_speech_timeout=1.7)],
+            ),
+            user_turn_stop_timeout=None,
+        ),
+    )
+
+    # 3. Configure Echo-Proof Gemini Live LLM Service
+    llm = EchoProofGeminiLLMService(
         api_key=settings.gemini_api_key,
+        user_aggregator=user_aggregator,
         settings=GeminiLiveLLMService.Settings(
-            model="models/gemini-2.0-flash-exp",
+            model="models/gemini-2.5-flash-native-audio-latest",
             voice="Puck",
             system_instruction=SYSTEM_PROMPT,
             thinking=ThinkingConfig(thinking_budget=0),
-            vad=GeminiVADParams(disabled=True),
+            vad=GeminiVADParams(disabled=False),
         ),
         tools=TOOL_DEFINITIONS,
     )
 
-    # 3. Register Tool Handlers
+    # 4. Register Tool Handlers
     async def handle_get_datetime(params: FunctionCallParams):
         """Handle get_current_datetime tool call."""
         log_tool_invoked("get_current_datetime", params.arguments)
@@ -140,9 +185,19 @@ async def run_bot(websocket, stream_sid: str = None, call_sid: str = None):
         # Pass transcript into save_summary
         kwargs = dict(params.arguments)
         kwargs["transcript"] = transcript
-        file_saved = save_summary(**kwargs)
+        kwargs["call_sid"] = call_key
+        
+        # Run in a background thread to prevent the 45-second LLM extraction from blocking Pipecat
+        loop = asyncio.get_running_loop()
+        def bg_save():
+            try:
+                save_summary(**kwargs)
+            except Exception as e:
+                logger.error(f"Error saving summary in background: {e}")
+                
+        loop.run_in_executor(None, bg_save)
 
-        log_tool_result("save_call_summary", {"status": "saved" if file_saved else "error", "file": file_saved})
+        log_tool_result("save_call_summary", {"status": "saving_in_background"})
 
         # Track that summary was saved via Gemini tool call
         _summary_saved_for_call[call_key] = True
@@ -157,39 +212,15 @@ async def run_bot(websocket, stream_sid: str = None, call_sid: str = None):
     llm.register_function("search_knowledge_base", handle_search_kb)
     llm.register_function("save_call_summary", handle_save_summary)
 
-    # 4. Setup Conversation Context & VAD
-    # VAD stop_secs=0.2 matches Pipecat's recommended default (the log warned about 0.25)
-    messages = [
-        {
-            "role": "user",
-            "content": "Welcome the caller to Stelar Interior and ask how you can help.",
-        }
-    ]
-
-    context = LLMContext(messages)
-    user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
-        context,
-        user_params=LLMUserAggregatorParams(
-            vad_analyzer=SileroVADAnalyzer(
-                params=VADParams(
-                    start_secs=0.3,
-                    stop_secs=0.2,
-                    confidence=0.75,
-                    min_volume=0.4,
-                )
-            ),
-            user_turn_strategies=UserTurnStrategies(
-                start=[VADUserTurnStartStrategy()],
-                stop=[SpeechTimeoutUserTurnStopStrategy(user_speech_timeout=0.6)],
-            ),
-            user_turn_stop_timeout=1.5,
-        ),
-    )
-
     # 5. Build the Pipeline
+    audio_gate = AudioGateProcessor()
+    idle_monitor = IdleMonitorProcessor(timeout_seconds=20.0)
+    
     pipeline = Pipeline(
         [
             transport.input(),
+            audio_gate,
+            idle_monitor,
             user_aggregator,
             llm,
             transport.output(),
@@ -211,10 +242,12 @@ async def run_bot(websocket, stream_sid: str = None, call_sid: str = None):
     async def on_client_connected(transport_instance, client):
         log_call_connected(call_sid or "unknown")
         log_pipeline_event("CLIENT CONNECTED", "Audio streaming started")
+        await idle_monitor.start_monitor(task)
         await task.queue_frames([LLMRunFrame()])
 
     @transport.event_handler("on_client_disconnected")
     async def on_client_disconnected(transport_instance, client):
+        await idle_monitor.stop_monitor()
         log_call_ended(call_sid or "unknown")
         log_pipeline_event("CLIENT DISCONNECTED", "Audio streaming ended")
 
@@ -232,6 +265,7 @@ async def run_bot(websocket, stream_sid: str = None, call_sid: str = None):
                 requirements=collected_details.get("requirements", ""),
                 conversation_summary=f"Call ended (SID: {call_key}). Full transcript attached below.",
                 transcript=transcript,
+                call_sid=call_key,
             )
 
         # Cleanup tracking
